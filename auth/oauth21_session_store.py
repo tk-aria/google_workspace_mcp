@@ -20,6 +20,8 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
+DEFAULT_OAUTH_STATE_TTL = int(os.getenv("OAUTH_STATE_TTL_SECONDS", "600"))
+
 from fastmcp.server.auth import AccessToken
 from google.oauth2.credentials import Credentials
 from auth.oauth_config import is_external_oauth21_provider
@@ -452,7 +454,7 @@ class OAuth21SessionStore:
         self,
         state: str,
         session_id: Optional[str] = None,
-        expires_in_seconds: int = 600,
+        expires_in_seconds: int = DEFAULT_OAUTH_STATE_TTL,
         code_verifier: Optional[str] = None,
     ) -> None:
         """Persist an OAuth state value for later validation."""
