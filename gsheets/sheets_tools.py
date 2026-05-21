@@ -187,6 +187,145 @@ async def get_spreadsheet_info(
     return text_output
 
 
+def _is_gray_color(color: Optional[dict]) -> bool:
+    """Detect if a Sheets API color (RGB 0..1) is a gray background.
+
+    Treats a cell as gray when R≈G≈B (within 0.05 each) and the channel value
+    is in the 0.50..0.95 range. Excludes pure white (default) and pure black.
+    """
+    if not color:
+        return False
+    r = color.get("red", 1.0)
+    g = color.get("green", 1.0)
+    b = color.get("blue", 1.0)
+    if r >= 0.99 and g >= 0.99 and b >= 0.99:
+        return False
+    if r <= 0.05 and g <= 0.05 and b <= 0.05:
+        return False
+    if abs(r - g) > 0.05 or abs(g - b) > 0.05 or abs(r - b) > 0.05:
+        return False
+    return 0.50 <= r <= 0.95
+
+
+def _rgb_to_hex(color: Optional[dict]) -> str:
+    """Convert Sheets API color (0..1 floats) to #rrggbb."""
+    if not color:
+        return "#ffffff"
+    r = int(round(color.get("red", 1.0) * 255))
+    g = int(round(color.get("green", 1.0) * 255))
+    b = int(round(color.get("blue", 1.0) * 255))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+async def _fetch_background_colors(
+    service, spreadsheet_id: str, range_name: str
+) -> List[List[dict]]:
+    """Fetch 2D background-color grid (effectiveFormat.backgroundColor) aligned to range."""
+    response = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            ranges=[range_name],
+            fields="sheets.data.rowData.values.effectiveFormat.backgroundColor",
+            includeGridData=True,
+        )
+        .execute
+    )
+    sheets = response.get("sheets", [])
+    if not sheets:
+        return []
+    data = sheets[0].get("data", [])
+    if not data:
+        return []
+    rows_data = data[0].get("rowData", [])
+    grid: List[List[dict]] = []
+    for row in rows_data:
+        cells = row.get("values", []) or []
+        row_colors = [
+            (cell.get("effectiveFormat", {}) or {}).get("backgroundColor", {}) or {}
+            for cell in cells
+        ]
+        grid.append(row_colors)
+    return grid
+
+
+def _format_background_section(
+    bg_grid: List[List[dict]], values: List[List[str]]
+) -> str:
+    """Build a human-readable section reporting gray rows/columns and non-default colors."""
+    if not bg_grid:
+        return ""
+    gray_row_indices: List[int] = []
+    non_default_cells: List[str] = []
+    n_rows = len(bg_grid)
+    n_cols = max((len(r) for r in bg_grid), default=0)
+    # Per-row: full-gray rows (all populated cells are gray)
+    for i, row_colors in enumerate(bg_grid):
+        if not row_colors:
+            continue
+        row_vals = values[i] if i < len(values) else []
+        if not any(str(v).strip() for v in row_vals):
+            continue  # skip empty rows
+        gray_cells = [
+            j for j, c in enumerate(row_colors)
+            if j < len(row_vals) and str(row_vals[j]).strip() and _is_gray_color(c)
+        ]
+        populated = [
+            j for j in range(min(len(row_colors), len(row_vals)))
+            if str(row_vals[j]).strip()
+        ]
+        if populated and len(gray_cells) == len(populated):
+            gray_row_indices.append(i + 1)  # 1-based
+    # Per-column: full-gray columns (used by AWC-style layouts where columns=records)
+    gray_col_indices: List[int] = []
+    for j in range(n_cols):
+        col_cells_with_value: List[bool] = []
+        col_cells_gray: List[bool] = []
+        for i, row_colors in enumerate(bg_grid):
+            row_vals = values[i] if i < len(values) else []
+            if j < len(row_vals) and str(row_vals[j]).strip():
+                col_cells_with_value.append(True)
+                col_cells_gray.append(
+                    j < len(row_colors) and _is_gray_color(row_colors[j])
+                )
+        if col_cells_with_value and all(col_cells_gray):
+            gray_col_indices.append(j + 1)
+    # Non-default colored cells (sample up to 30)
+    for i, row_colors in enumerate(bg_grid[:200]):
+        for j, c in enumerate(row_colors):
+            if not c:
+                continue
+            r = c.get("red", 1.0)
+            g = c.get("green", 1.0)
+            b = c.get("blue", 1.0)
+            if r >= 0.99 and g >= 0.99 and b >= 0.99:
+                continue
+            non_default_cells.append(
+                f"  R{i+1}C{j+1}: {_rgb_to_hex(c)}"
+                + (" [gray]" if _is_gray_color(c) else "")
+            )
+            if len(non_default_cells) >= 30:
+                break
+        if len(non_default_cells) >= 30:
+            break
+    parts = ["\n\nBackground formatting:"]
+    if gray_row_indices:
+        parts.append(
+            f"  Likely-ended rows (full gray, possibly 営業終了): {gray_row_indices}"
+        )
+    if gray_col_indices:
+        parts.append(
+            f"  Likely-ended columns (full gray, possibly 営業終了): {gray_col_indices}"
+        )
+    if non_default_cells:
+        parts.append("  Non-default colored cells (sample):")
+        parts.extend(non_default_cells)
+    if len(parts) == 1:
+        parts.append("  (no non-default background colors detected)")
+    return "\n".join(parts)
+
+
+
 @server.tool(
     title="Read Sheet Values",
     annotations=ToolAnnotations(
@@ -206,6 +345,7 @@ async def read_sheet_values(
     include_hyperlinks: bool = False,
     include_notes: bool = False,
     include_formulas: bool = False,
+    include_formatting: bool = False,
 ) -> str:
     """
     Reads values from a specific range in a Google Sheet.
@@ -221,6 +361,9 @@ async def read_sheet_values(
         include_formulas (bool): If True, also fetch raw formula strings for cells that
             contain formulas. Useful for identifying cross-sheet references before writing
             back to a range. Defaults to False to avoid an extra API request.
+        include_formatting (bool): If True, also fetch per-cell background colors and
+            report gray-flagged rows/columns (used by sheets where gray = 営業終了 /
+            archived). Defaults to False to avoid an extra includeGridData request.
 
     Returns:
         str: The formatted values from the specified range.
@@ -300,6 +443,21 @@ async def read_sheet_values(
         + (f"\n... and {len(values) - 50} more rows" if len(values) > 50 else "")
     )
 
+    formatting_section = ""
+    if include_formatting:
+        try:
+            bg_grid = await _fetch_background_colors(
+                service, spreadsheet_id, detailed_range
+            )
+            formatting_section = _format_background_section(bg_grid, values)
+        except Exception as exc:
+            logger.warning(
+                "[read_sheet_values] Failed fetching background colors for range '%s': %s",
+                detailed_range,
+                exc,
+            )
+            formatting_section = f"\n\nBackground formatting: (fetch failed: {exc})"
+
     logger.info(f"Successfully read {len(values)} rows for {user_google_email}.")
     return (
         text_output
@@ -307,6 +465,7 @@ async def read_sheet_values(
         + notes_section
         + formula_section
         + detailed_errors_section
+        + formatting_section
     )
 
 

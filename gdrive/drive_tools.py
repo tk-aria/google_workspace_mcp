@@ -2630,3 +2630,435 @@ async def set_drive_file_permissions(
     output_parts.extend(["", f"View link: {file_metadata.get('webViewLink', 'N/A')}"])
 
     return "\n".join(output_parts)
+    return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("list_drive_revisions", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def list_drive_revisions(
+    service,
+    user_google_email: str,
+    file_id: str,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+) -> str:
+    """
+    List revisions (edit history) of a Google Drive file.
+
+    Drive retains revisions for ~30 days or up to 100 entries by default.
+    Revisions with keepForever=true persist beyond that limit (max 200).
+    Native Google Docs/Sheets/Slides revisions are coalesced (typically grouped
+    in ~minute-level buckets), so cell-level granularity is not available.
+
+    Args:
+        user_google_email: The user's Google email address.
+        file_id: Drive file ID.
+        page_size: Max revisions per page (1-1000). Defaults to 100.
+        page_token: Page token from a previous response. Optional.
+
+    Returns:
+        str: Formatted list of revisions with id, modifiedTime, lastModifyingUser,
+             keepForever, size, mimeType. Includes nextPageToken when available.
+    """
+    logger.info(f"[list_drive_revisions] file_id={file_id}, page_size={page_size}")
+
+    params: Dict[str, Any] = {
+        "fileId": file_id,
+        "pageSize": max(1, min(page_size, 1000)),
+        "fields": "nextPageToken,revisions(id,modifiedTime,keepForever,published,size,mimeType,lastModifyingUser(displayName,emailAddress),originalFilename)",
+    }
+    if page_token:
+        params["pageToken"] = page_token
+
+    result = await asyncio.to_thread(service.revisions().list(**params).execute)
+    revisions = result.get("revisions", [])
+    if not revisions:
+        return f"No revisions found for file {file_id}."
+
+    lines = [f"Found {len(revisions)} revisions for file {file_id}:"]
+    for rev in revisions:
+        user = rev.get("lastModifyingUser") or {}
+        user_str = user.get("displayName") or user.get("emailAddress") or "Unknown"
+        size_str = f", Size: {rev['size']}" if "size" in rev else ""
+        keep_str = " [keepForever]" if rev.get("keepForever") else ""
+        pub_str = " [published]" if rev.get("published") else ""
+        lines.append(
+            f"- ID: {rev['id']}, Modified: {rev.get('modifiedTime', 'N/A')}, "
+            f"By: {user_str}{size_str}, Mime: {rev.get('mimeType', 'N/A')}"
+            f"{keep_str}{pub_str}"
+        )
+    next_token = result.get("nextPageToken")
+    if next_token:
+        lines.append(f"nextPageToken: {next_token}")
+    return "\n".join(lines)
+
+
+@server.tool()
+@handle_http_errors("get_drive_revision", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def get_drive_revision(
+    service,
+    user_google_email: str,
+    file_id: str,
+    revision_id: str,
+) -> str:
+    """
+    Get metadata for a single revision of a Google Drive file.
+
+    Args:
+        user_google_email: The user's Google email address.
+        file_id: Drive file ID.
+        revision_id: Revision ID (from list_drive_revisions).
+
+    Returns:
+        str: Formatted metadata for the revision.
+    """
+    logger.info(f"[get_drive_revision] file_id={file_id}, revision_id={revision_id}")
+
+    rev = await asyncio.to_thread(
+        service.revisions()
+        .get(
+            fileId=file_id,
+            revisionId=revision_id,
+            fields="id,modifiedTime,keepForever,published,size,mimeType,lastModifyingUser(displayName,emailAddress),originalFilename,exportLinks",
+        )
+        .execute
+    )
+    user = rev.get("lastModifyingUser") or {}
+    user_str = user.get("displayName") or user.get("emailAddress") or "Unknown"
+    lines = [
+        f"Revision: {rev['id']}",
+        f"  Modified: {rev.get('modifiedTime', 'N/A')}",
+        f"  By: {user_str}",
+        f"  Mime: {rev.get('mimeType', 'N/A')}",
+    ]
+    if "size" in rev:
+        lines.append(f"  Size: {rev['size']}")
+    if "originalFilename" in rev:
+        lines.append(f"  OriginalFilename: {rev['originalFilename']}")
+    if rev.get("keepForever"):
+        lines.append("  KeepForever: true")
+    if rev.get("published"):
+        lines.append("  Published: true")
+    export_links = rev.get("exportLinks") or {}
+    if export_links:
+        lines.append("  ExportLinks:")
+        for mime, link in export_links.items():
+            lines.append(f"    {mime}: {link}")
+    return "\n".join(lines)
+
+
+@server.tool()
+@handle_http_errors("get_drive_revision_content", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def get_drive_revision_content(
+    service,
+    user_google_email: str,
+    file_id: str,
+    revision_id: str,
+    export_mime_type: Optional[str] = None,
+) -> str:
+    """
+    Download the content of a specific revision.
+
+    Native Google Docs/Sheets/Slides revisions cannot be fetched via get_media —
+    they must be exported. Provide export_mime_type (e.g. text/plain, text/csv)
+    or rely on the default mapping (Docs→text/plain, Sheets→text/csv,
+    Slides→text/plain).
+
+    Binary files (PDF, images, etc.) are downloaded raw; if the bytes cannot
+    be decoded as UTF-8 a notice is returned instead of the content.
+
+    Args:
+        user_google_email: The user's Google email address.
+        file_id: Drive file ID.
+        revision_id: Revision ID.
+        export_mime_type: Optional override for native Google file export.
+
+    Returns:
+        str: Revision content as text (or a notice for binary content).
+    """
+    logger.info(
+        f"[get_drive_revision_content] file_id={file_id}, revision_id={revision_id}"
+    )
+
+    rev_meta = await asyncio.to_thread(
+        service.revisions()
+        .get(fileId=file_id, revisionId=revision_id, fields="mimeType")
+        .execute
+    )
+    mime_type = rev_meta.get("mimeType", "")
+    default_export = {
+        "application/vnd.google-apps.document": "text/plain",
+        "application/vnd.google-apps.spreadsheet": "text/csv",
+        "application/vnd.google-apps.presentation": "text/plain",
+    }.get(mime_type)
+    is_native = mime_type.startswith("application/vnd.google-apps.")
+
+    if is_native:
+        chosen = export_mime_type or default_export
+        if not chosen:
+            return (
+                f"Revision {revision_id} is a native Google file ({mime_type}); "
+                "specify export_mime_type to download."
+            )
+        # Drive Revisions API does not expose export_media directly; use exportLinks.
+        rev_full = await asyncio.to_thread(
+            service.revisions()
+            .get(fileId=file_id, revisionId=revision_id, fields="exportLinks")
+            .execute
+        )
+        export_url = (rev_full.get("exportLinks") or {}).get(chosen)
+        if not export_url:
+            return (
+                f"No exportLink available for mime '{chosen}'. "
+                f"Available: {list((rev_full.get('exportLinks') or {}).keys())}"
+            )
+        # Authorize via the service's underlying http credentials.
+        creds = getattr(service, "_http", None)
+        if creds is None:
+            return "Internal error: cannot reuse service credentials for export."
+        resp = await asyncio.to_thread(creds.request, export_url)
+        # googleapiclient http returns (httplib2.Response, content-bytes)
+        if isinstance(resp, tuple) and len(resp) == 2:
+            _, content_bytes = resp
+        else:
+            content_bytes = resp
+    else:
+        request_obj = service.revisions().get_media(
+            fileId=file_id, revisionId=revision_id
+        )
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request_obj)
+        loop = asyncio.get_event_loop()
+        done = False
+        while not done:
+            _, done = await loop.run_in_executor(None, downloader.next_chunk)
+        content_bytes = fh.getvalue()
+
+    try:
+        return content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return (
+            f"[binary content, {len(content_bytes)} bytes, mime={mime_type}, "
+            f"revision={revision_id}]"
+        )
+
+
+# ===========================================================================
+# xlsx with formatting (for files where gray background == archived / 営業終了)
+# ===========================================================================
+
+XLSX_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+def _xlsx_argb_is_gray(argb: Optional[str]) -> bool:
+    """Detect gray background from openpyxl ARGB hex string like 'FFD9D9D9'."""
+    if not argb or not isinstance(argb, str):
+        return False
+    # Strip alpha prefix if present (8 chars = AARRGGBB, 6 chars = RRGGBB)
+    hex_str = argb.upper()
+    if len(hex_str) == 8:
+        hex_str = hex_str[2:]
+    if len(hex_str) != 6:
+        return False
+    try:
+        r = int(hex_str[0:2], 16)
+        g = int(hex_str[2:4], 16)
+        b = int(hex_str[4:6], 16)
+    except ValueError:
+        return False
+    if r >= 252 and g >= 252 and b >= 252:
+        return False  # white
+    if r <= 8 and g <= 8 and b <= 8:
+        return False  # black
+    if abs(r - g) > 12 or abs(g - b) > 12 or abs(r - b) > 12:
+        return False
+    return 128 <= r <= 242
+
+
+def _xlsx_fill_argb(cell) -> Optional[str]:
+    """Extract a usable ARGB string from an openpyxl cell's fill."""
+    fill = getattr(cell, "fill", None)
+    if fill is None:
+        return None
+    pattern = getattr(fill, "patternType", None) or getattr(fill, "fill_type", None)
+    if not pattern:
+        return None
+    fg = getattr(fill, "fgColor", None) or getattr(fill, "start_color", None)
+    if fg is None:
+        return None
+    # openpyxl Color: rgb / theme / indexed / type
+    rgb = getattr(fg, "rgb", None)
+    if isinstance(rgb, str) and rgb:
+        return rgb
+    return None
+
+
+@server.tool()
+@handle_http_errors("read_xlsx_with_formatting", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def read_xlsx_with_formatting(
+    service,
+    user_google_email: str,
+    file_id: str,
+    sheet_name: Optional[str] = None,
+    max_rows: int = 200,
+    max_cols: int = 60,
+    include_formatting: bool = True,
+) -> str:
+    """
+    Read an xlsx Drive file with optional per-cell background color detection.
+
+    Designed for AWC-style sheets where gray background marks 営業終了 / archived
+    records. Returns values plus a "Background formatting" section listing
+    gray-flagged rows and columns when include_formatting=True.
+
+    Args:
+        user_google_email: The user's Google email address.
+        file_id: Drive file ID of an xlsx file.
+        sheet_name: Sheet (tab) name. If omitted, the active/first sheet is used.
+        max_rows: Cap on rows to return (default 200).
+        max_cols: Cap on columns to return (default 60).
+        include_formatting: If True (default), detect gray-flagged rows/columns.
+
+    Returns:
+        str: Values formatted as rows + a formatting summary section.
+    """
+    logger.info(
+        f"[read_xlsx_with_formatting] file_id={file_id} sheet='{sheet_name}'"
+        f" rows<={max_rows} cols<={max_cols} formatting={include_formatting}"
+    )
+
+    # Resolve metadata to confirm mime type
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name, mimeType"
+    )
+    file_id = resolved_file_id
+    mime_type = file_metadata.get("mimeType", "")
+    file_name = file_metadata.get("name", "Unknown File")
+    if mime_type != XLSX_MIME_TYPE:
+        return (
+            f"File '{file_name}' (mime={mime_type}) is not an xlsx file. "
+            "Use read_sheet_values for native Google Sheets or convert the "
+            "file to xlsx first."
+        )
+
+    # Download bytes
+    request_obj = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_obj)
+    loop = asyncio.get_event_loop()
+    done = False
+    while not done:
+        _, done = await loop.run_in_executor(None, downloader.next_chunk)
+    xlsx_bytes = fh.getvalue()
+
+    # Load with openpyxl (data_only=True to get computed values, not formulas)
+    try:
+        import openpyxl  # type: ignore
+    except ImportError:
+        return "openpyxl is not installed in this runtime; cannot parse xlsx."
+
+    def _parse() -> str:
+        wb = openpyxl.load_workbook(
+            io.BytesIO(xlsx_bytes), read_only=False, data_only=True
+        )
+        target_sheet_name = sheet_name or wb.active.title
+        if target_sheet_name not in wb.sheetnames:
+            return (
+                f"Sheet '{target_sheet_name}' not found. "
+                f"Available sheets: {wb.sheetnames}"
+            )
+        ws = wb[target_sheet_name]
+        n_rows = min(ws.max_row or 0, max_rows)
+        n_cols = min(ws.max_column or 0, max_cols)
+        if n_rows == 0 or n_cols == 0:
+            return f"Sheet '{target_sheet_name}' is empty."
+
+        values: List[List[str]] = []
+        bg_grid: List[List[Optional[str]]] = []
+        for r in range(1, n_rows + 1):
+            row_vals: List[str] = []
+            row_bg: List[Optional[str]] = []
+            for c in range(1, n_cols + 1):
+                cell = ws.cell(row=r, column=c)
+                val = cell.value
+                row_vals.append("" if val is None else str(val))
+                row_bg.append(_xlsx_fill_argb(cell) if include_formatting else None)
+            values.append(row_vals)
+            bg_grid.append(row_bg)
+
+        lines = [
+            f"Successfully read sheet '{target_sheet_name}' from xlsx "
+            f"'{file_name}' (rows={n_rows}, cols={n_cols}):"
+        ]
+        # Print up to 50 rows inline
+        for i, row in enumerate(values[:50], 1):
+            lines.append(f"Row {i:2d}: {row}")
+        if len(values) > 50:
+            lines.append(f"... and {len(values) - 50} more rows")
+
+        if include_formatting:
+            gray_rows: List[int] = []
+            gray_cols: List[int] = []
+            non_default_sample: List[str] = []
+            # full-gray rows
+            for i, (row_vals, row_bg) in enumerate(zip(values, bg_grid), 1):
+                populated_idx = [j for j, v in enumerate(row_vals) if v.strip()]
+                if not populated_idx:
+                    continue
+                gray_idx = [
+                    j for j in populated_idx if _xlsx_argb_is_gray(row_bg[j])
+                ]
+                if gray_idx and len(gray_idx) == len(populated_idx):
+                    gray_rows.append(i)
+            # full-gray columns
+            for j in range(n_cols):
+                populated_rows = [
+                    i for i in range(n_rows) if values[i][j].strip()
+                ]
+                if not populated_rows:
+                    continue
+                if all(_xlsx_argb_is_gray(bg_grid[i][j]) for i in populated_rows):
+                    gray_cols.append(j + 1)
+            # sample non-default cells
+            for i in range(min(n_rows, 200)):
+                for j in range(n_cols):
+                    argb = bg_grid[i][j]
+                    if not argb:
+                        continue
+                    hex_str = argb.upper()
+                    if len(hex_str) == 8:
+                        hex_str = hex_str[2:]
+                    if hex_str.upper() in ("FFFFFF", "00000000"):
+                        continue
+                    tag = " [gray]" if _xlsx_argb_is_gray(argb) else ""
+                    non_default_sample.append(f"  R{i+1}C{j+1}: #{hex_str}{tag}")
+                    if len(non_default_sample) >= 30:
+                        break
+                if len(non_default_sample) >= 30:
+                    break
+
+            lines.append("")
+            lines.append("Background formatting:")
+            if gray_rows:
+                lines.append(
+                    f"  Likely-ended rows (full gray, possibly 営業終了): {gray_rows}"
+                )
+            if gray_cols:
+                lines.append(
+                    f"  Likely-ended columns (full gray, possibly 営業終了): {gray_cols}"
+                )
+            if non_default_sample:
+                lines.append("  Non-default colored cells (sample):")
+                lines.extend(non_default_sample)
+            if not gray_rows and not gray_cols and not non_default_sample:
+                lines.append("  (no non-default background colors detected)")
+
+        return "\n".join(lines)
+
+    return await loop.run_in_executor(None, _parse)
