@@ -40,13 +40,22 @@ async def _manage_comment_dispatch(
     action: str,
     comment_content: Optional[str] = None,
     comment_id: Optional[str] = None,
+    anchor_text: Optional[str] = None,
+    anchor_mime_type: Optional[str] = None,
 ) -> str:
     """Route comment management actions to the appropriate implementation."""
     action_lower = action.lower().strip()
     if action_lower == "create":
         if not comment_content:
             raise ValueError("comment_content is required for create action")
-        return await _create_comment_impl(service, app_name, file_id, comment_content)
+        return await _create_comment_impl(
+            service,
+            app_name,
+            file_id,
+            comment_content,
+            anchor_text=anchor_text,
+            anchor_mime_type=anchor_mime_type,
+        )
     elif action_lower == "reply":
         if not comment_id or not comment_content:
             raise ValueError(
@@ -102,18 +111,30 @@ def create_comment_tools(app_name: str, file_id_param: str):
             action: str,
             comment_content: Optional[str] = None,
             comment_id: Optional[str] = None,
+            anchor_text: Optional[str] = None,
+            anchor_mime_type: Optional[str] = None,
         ) -> str:
             """Manage comments on a Google Document.
 
             Actions:
-              - create: Create a new document-level comment. Requires comment_content.
-                Note: The Drive API cannot anchor comments to specific text; only
-                the Google Docs UI can do that.
+              - create: Create a new comment. Requires comment_content.
+                Optionally anchor the comment to specific text by passing
+                anchor_text — the value must exactly match text that exists in
+                the document (maps to Drive API quotedFileContent.value).
+                anchor_mime_type defaults to "text/html" and maps to
+                quotedFileContent.mimeType.
               - reply: Reply to a comment. Requires comment_id and comment_content.
               - resolve: Resolve a comment. Requires comment_id.
             """
             return await _manage_comment_dispatch(
-                service, app_name, document_id, action, comment_content, comment_id
+                service,
+                app_name,
+                document_id,
+                action,
+                comment_content,
+                comment_id,
+                anchor_text=anchor_text,
+                anchor_mime_type=anchor_mime_type,
             )
 
     elif file_id_param == "spreadsheet_id":
@@ -136,18 +157,28 @@ def create_comment_tools(app_name: str, file_id_param: str):
             action: str,
             comment_content: Optional[str] = None,
             comment_id: Optional[str] = None,
+            anchor_text: Optional[str] = None,
+            anchor_mime_type: Optional[str] = None,
         ) -> str:
             """Manage comments on a Google Spreadsheet.
 
             Actions:
               - create: Create a new comment. Requires comment_content.
-                Note: The Drive API cannot anchor comments to arbitrary text;
-                Sheets comments are cell-scoped via the API.
+                Sheets comments are typically cell-scoped via the API; passing
+                anchor_text sets Drive API quotedFileContent but Sheets UI may
+                not render the anchor the same way as Docs.
               - reply: Reply to a comment. Requires comment_id and comment_content.
               - resolve: Resolve a comment. Requires comment_id.
             """
             return await _manage_comment_dispatch(
-                service, app_name, spreadsheet_id, action, comment_content, comment_id
+                service,
+                app_name,
+                spreadsheet_id,
+                action,
+                comment_content,
+                comment_id,
+                anchor_text=anchor_text,
+                anchor_mime_type=anchor_mime_type,
             )
 
     elif file_id_param == "presentation_id":
@@ -170,18 +201,28 @@ def create_comment_tools(app_name: str, file_id_param: str):
             action: str,
             comment_content: Optional[str] = None,
             comment_id: Optional[str] = None,
+            anchor_text: Optional[str] = None,
+            anchor_mime_type: Optional[str] = None,
         ) -> str:
             """Manage comments on a Google Presentation.
 
             Actions:
               - create: Create a new comment. Requires comment_content.
-                Note: The Drive API cannot anchor comments to arbitrary text;
-                Slides comments are element-scoped via the API.
+                Slides comments are typically element-scoped via the API;
+                passing anchor_text sets Drive API quotedFileContent but the
+                Slides UI may not render the anchor the same way as Docs.
               - reply: Reply to a comment. Requires comment_id and comment_content.
               - resolve: Resolve a comment. Requires comment_id.
             """
             return await _manage_comment_dispatch(
-                service, app_name, presentation_id, action, comment_content, comment_id
+                service,
+                app_name,
+                presentation_id,
+                action,
+                comment_content,
+                comment_id,
+                anchor_text=anchor_text,
+                anchor_mime_type=anchor_mime_type,
             )
 
     list_comments.__name__ = list_func_name
@@ -258,24 +299,37 @@ async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
 
 
 async def _create_comment_impl(
-    service, app_name: str, file_id: str, comment_content: str
+    service,
+    app_name: str,
+    file_id: str,
+    comment_content: str,
+    anchor_text: Optional[str] = None,
+    anchor_mime_type: Optional[str] = None,
 ) -> str:
     """Implementation for creating a comment on any Google Workspace file.
 
-    Note: Comments created via the Drive API appear as document-level comments.
-    The Google Drive API does not support anchoring comments to specific text in
-    Google Docs; only the Docs UI can create anchored comments.
+    When anchor_text is provided, the comment is anchored to that text via the
+    Drive API quotedFileContent field. The anchor_text must exactly match text
+    that exists in the file.
     """
-    logger.info(f"[create_{app_name}_comment] Creating comment in {app_name} {file_id}")
+    logger.info(
+        f"[create_{app_name}_comment] Creating comment in {app_name} {file_id}"
+        f"{' (anchored)' if anchor_text else ''}"
+    )
 
-    body = {"content": comment_content}
+    body: dict = {"content": comment_content}
+    if anchor_text:
+        body["quotedFileContent"] = {
+            "mimeType": anchor_mime_type or "text/html",
+            "value": anchor_text,
+        }
 
     comment = await asyncio.to_thread(
         service.comments()
         .create(
             fileId=file_id,
             body=body,
-            fields="id,content,author,createdTime,modifiedTime",
+            fields="id,content,author,createdTime,modifiedTime,quotedFileContent",
         )
         .execute
     )
@@ -283,8 +337,15 @@ async def _create_comment_impl(
     comment_id = comment.get("id", "")
     author = comment.get("author", {}).get("displayName", "Unknown")
     created = comment.get("createdTime", "")
+    quoted = comment.get("quotedFileContent", {}).get("value", "")
 
-    return f"Comment created successfully!\\nComment ID: {comment_id}\\nAuthor: {author}\\nCreated: {created}\\nContent: {comment_content}"
+    result = (
+        f"Comment created successfully!\\nComment ID: {comment_id}\\n"
+        f"Author: {author}\\nCreated: {created}\\nContent: {comment_content}"
+    )
+    if quoted:
+        result += f"\\nAnchored to: {quoted}"
+    return result
 
 
 async def _reply_to_comment_impl(
